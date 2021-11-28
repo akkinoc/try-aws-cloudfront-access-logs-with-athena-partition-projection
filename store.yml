@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: try-aws-cloudfront-access-logs-with-athena-partition-projection
+Parameters:
+  Name:
+    Type: String
+    AllowedPattern: \w+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Name}-store
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${Name}
+  GlueEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: events
+        StorageDescriptor:
+          Columns:
+            - Name: date
+              Type: date
+            - Name: time
+              Type: string
+            - Name: x_edge_location
+              Type: string
+            - Name: sc_bytes
+              Type: bigint
+            - Name: c_ip
+              Type: string
+            - Name: cs_method
+              Type: string
+            - Name: cs_host
+              Type: string
+            - Name: cs_uri_stem
+              Type: string
+            - Name: sc_status
+              Type: int
+            - Name: cs_referer
+              Type: string
+            - Name: cs_user_agent
+              Type: string
+            - Name: cs_uri_query
+              Type: string
+            - Name: cs_cookie
+              Type: string
+            - Name: x_edge_result_type
+              Type: string
+            - Name: x_edge_request_id
+              Type: string
+            - Name: x_host_header
+              Type: string
+            - Name: cs_protocol
+              Type: string
+            - Name: cs_bytes
+              Type: bigint
+            - Name: time_taken
+              Type: float
+            - Name: x_forwarded_for
+              Type: string
+            - Name: ssl_protocol
+              Type: string
+            - Name: ssl_cipher
+              Type: string
+            - Name: x_edge_response_result_type
+              Type: string
+            - Name: cs_protocol_version
+              Type: string
+            - Name: fle_status
+              Type: string
+            - Name: fle_encrypted_fields
+              Type: string
+            - Name: c_port
+              Type: int
+            - Name: time_to_first_byte
+              Type: float
+            - Name: x_edge_detailed_result_type
+              Type: string
+            - Name: sc_content_type
+              Type: string
+            - Name: sc_content_len
+              Type: bigint
+            - Name: sc_range_start
+              Type: bigint
+            - Name: sc_range_end
+              Type: bigint
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+            Parameters:
+              field.delim: "\t"
+              serialization.format: "\t"
+          Location: !Sub s3://${S3Bucket}/events/
+        PartitionKeys:
+          - Name: dt
+            Type: string
+        Parameters:
+          skip.header.line.count: 2
+          projection.enabled: true
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd-HH
+          projection.dt.range: 2021-10-31-15,NOW
+          projection.dt.interval: 1
+          projection.dt.interval.unit: hours
+  ServerlessEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Name}-store-events
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 60
+      InlineCode: |
+        // https://github.com/aws-samples/amazon-cloudfront-access-logs-queries/blob/mainline/functions/moveAccessLogs.js
+        // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+        // SPDX-License-Identifier: MIT-0
+        const aws = require('aws-sdk');
+        const s3 = new aws.S3({ apiVersion: '2006-03-01' });
+        // prefix to copy partitioned data to w/o leading but w/ trailing slash
+        const targetKeyPrefix = process.env.TARGET_KEY_PREFIX;
+        // regex for filenames by Amazon CloudFront access logs. Groups:
+        // - 1.	year
+        // - 2.	month
+        // - 3.	day
+        // - 4.	hour
+        const datePattern = '[^\\d](\\d{4})-(\\d{2})-(\\d{2})-(\\d{2})[^\\d]';
+        const filenamePattern = '[^/]+$';
+        exports.handler = async (event, context, callback) => {
+          const moves = event.Records.map(record => {
+            const bucket = record.s3.bucket.name;
+            const sourceKey = record.s3.object.key;
+            const sourceRegex = new RegExp(datePattern, 'g');
+            const match = sourceRegex.exec(sourceKey);
+            if (match == null) {
+              console.log(`Object key ${sourceKey} does not look like an access log file, so it will not be moved.`);
+            } else {
+              const [, year, month, day, hour] = match;
+              const filenameRegex = new RegExp(filenamePattern, 'g');
+              const filename = filenameRegex.exec(sourceKey)[0];
+              // const targetKey = `${targetKeyPrefix}year=${year}/month=${month}/day=${day}/hour=${hour}/${filename}`;
+              const targetKey = `${targetKeyPrefix}dt=${year}-${month}-${day}-${hour}/${filename}`;
+              console.log(`Copying ${sourceKey} to ${targetKey}.`);
+              const copyParams = {
+                CopySource: bucket + '/' + sourceKey,
+                Bucket: bucket,
+                Key: targetKey
+              };
+              const copy = s3.copyObject(copyParams).promise();
+              const deleteParams = { Bucket: bucket, Key: sourceKey };
+              return copy.then(function () {
+                console.log(`Copied. Now deleting ${sourceKey}.`);
+                const del = s3.deleteObject(deleteParams).promise();
+                console.log(`Deleted ${sourceKey}.`);
+                return del;
+              }, function (reason) {
+                var error = new Error(`Error while copying ${sourceKey}: ${reason}`);
+                callback(error);
+              });
+            }
+          });
+          await Promise.all(moves);
+        };
+      Policies:
+        - Statement:
+            - Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Effect: Allow
+              Resource: !Sub arn:${AWS::Partition}:s3:::${Name}-store/new-events/*
+            - Action:
+                - s3:PutObject
+              Effect: Allow
+              Resource: !Sub arn:${AWS::Partition}:s3:::${Name}-store/events/*
+      Environment:
+        Variables:
+          TARGET_KEY_PREFIX: events/
+      Events:
+        S3:
+          Type: S3
+          Properties:
+            Bucket: !Ref S3Bucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: new-events/
